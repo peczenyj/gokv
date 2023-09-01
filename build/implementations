@@ -22,3 +22,5 @@ syncmap
 tablestorage
 tablestore
 zookeeper
+middleware
+middleware/logrus

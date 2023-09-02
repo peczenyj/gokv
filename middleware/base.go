@@ -4,8 +4,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
-	"io"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -16,28 +15,28 @@ var traceIDKey traceIDKeyType = "trace-id"
 
 type traceIDKeyType string
 
-// TraceID is a unique identity of a trace.
-// "inspired" on "go.opentelemetry.io/otel/trace".TraceID
-type TraceID [16]byte
+type TraceID uint64
 
 var nilTraceID TraceID
 
 // String returns the hex string representation form of a TraceID.
 func (t TraceID) String() string {
-	return hex.EncodeToString(t[:])
+	return fmt.Sprintf("%#016x", uint64(t))
 }
 
 // GetTraceIDFromContext extract the trace id from context, if any
 func GetTraceIDFromContext(ctx context.Context) (TraceID, bool) {
 	v := ctx.Value(traceIDKey)
-	if v != nil {
-		return v.(TraceID), true
+	if v == nil {
+		return nilTraceID, false
 	}
 
-	return nilTraceID, false
+	traceID, ok := v.(TraceID)
+
+	return traceID, ok
 }
 
-type TraceCallback func(ctx context.Context, method string, args map[string]interface{})
+type TraceCallback func(ctx context.Context, method string, args map[string]interface{}) (done func(context.Context, error))
 
 type SetCallback func(ctx context.Context, duration time.Duration, k string, v interface{}, err error)
 
@@ -50,33 +49,53 @@ type CloseCallback func(ctx context.Context, duration time.Duration, err error)
 type middleware struct {
 	inner gokv.Store
 
-	randReader io.Reader
+	randomSource64 rand.Source64
 
 	traceCallbacks  []TraceCallback
-	closeCallbacks  []CloseCallback
-	deleteCallbacks []DeleteCallback
-	getCallbacks    []GetCallback
 	setCallbacks    []SetCallback
+	getCallbacks    []GetCallback
+	deleteCallbacks []DeleteCallback
+	closeCallbacks  []CloseCallback
+
+	setHitCounters    []Incrementer
+	getHitCounters    []Incrementer
+	getMissCounters   []Incrementer
+	deleteHitCounters []Incrementer
+
+	setObservers    []Observer
+	getObservers    []Observer
+	deleteObservers []Observer
 }
 
-func (m *middleware) Set(k string, v interface{}) error {
-	ctx := context.Background()
+func (m *middleware) fetchTraceID() TraceID {
+	return TraceID(m.randomSource64.Uint64())
+}
 
-	var traceID TraceID
-	_, _ = m.randReader.Read(traceID[:])
+func (m *middleware) wrapContextWithTraceID(ctx context.Context) context.Context {
+	traceID := m.fetchTraceID()
 
-	ctx = context.WithValue(ctx, traceIDKey, traceID)
+	return context.WithValue(ctx, traceIDKey, traceID)
+}
+
+func (m *middleware) Set(k string, v interface{}) (err error) {
+	for _, counter := range m.setHitCounters {
+		counter.Inc()
+	}
+
+	ctx := m.wrapContextWithTraceID(context.Background())
 
 	for _, callback := range m.traceCallbacks {
-		callback(ctx, "set", map[string]interface{}{
+		done := callback(ctx, "set", map[string]interface{}{
 			"key":   k,
 			"value": v,
 		})
+
+		defer done(ctx, err)
 	}
 
 	begin := time.Now()
 
-	err := m.inner.Set(k, v)
+	err = m.inner.Set(k, v)
 
 	duration := time.Since(begin)
 
@@ -84,27 +103,38 @@ func (m *middleware) Set(k string, v interface{}) error {
 		callback(ctx, duration, k, v, err)
 	}
 
+	for _, observer := range m.setObservers {
+		observer.Observe(duration.Seconds())
+	}
+
 	return err
 }
 
 func (m *middleware) Get(k string, v interface{}) (found bool, err error) {
-	ctx := context.Background()
+	for _, counter := range m.getHitCounters {
+		counter.Inc()
+	}
 
-	var traceID TraceID
-	_, _ = m.randReader.Read(traceID[:])
-
-	ctx = context.WithValue(ctx, traceIDKey, traceID)
+	ctx := m.wrapContextWithTraceID(context.Background())
 
 	for _, callback := range m.traceCallbacks {
-		callback(ctx, "get", map[string]interface{}{
+		done := callback(ctx, "get", map[string]interface{}{
 			"key":   k,
 			"value": v,
 		})
+
+		defer done(ctx, err)
 	}
 
 	begin := time.Now()
 
 	found, err = m.inner.Get(k, v)
+
+	if !found {
+		for _, counter := range m.getMissCounters {
+			counter.Inc()
+		}
+	}
 
 	duration := time.Since(begin)
 
@@ -112,26 +142,31 @@ func (m *middleware) Get(k string, v interface{}) (found bool, err error) {
 		callback(ctx, duration, k, v, found, err)
 	}
 
+	for _, observer := range m.getObservers {
+		observer.Observe(duration.Seconds())
+	}
+
 	return found, err
 }
 
-func (m *middleware) Delete(k string) error {
-	ctx := context.Background()
+func (m *middleware) Delete(k string) (err error) {
+	for _, counter := range m.deleteHitCounters {
+		counter.Inc()
+	}
 
-	var traceID TraceID
-	_, _ = m.randReader.Read(traceID[:])
-
-	ctx = context.WithValue(ctx, traceIDKey, traceID)
+	ctx := m.wrapContextWithTraceID(context.Background())
 
 	for _, callback := range m.traceCallbacks {
-		callback(ctx, "delete", map[string]interface{}{
+		done := callback(ctx, "delete", map[string]interface{}{
 			"key": k,
 		})
+
+		defer done(ctx, err)
 	}
 
 	begin := time.Now()
 
-	err := m.inner.Delete(k)
+	err = m.inner.Delete(k)
 
 	duration := time.Since(begin)
 
@@ -139,24 +174,25 @@ func (m *middleware) Delete(k string) error {
 		callback(ctx, duration, k, err)
 	}
 
+	for _, observer := range m.deleteObservers {
+		observer.Observe(duration.Seconds())
+	}
+
 	return err
 }
 
-func (m *middleware) Close() error {
-	ctx := context.Background()
-
-	var traceID TraceID
-	_, _ = m.randReader.Read(traceID[:])
-
-	ctx = context.WithValue(ctx, traceIDKey, traceID)
+func (m *middleware) Close() (err error) {
+	ctx := m.wrapContextWithTraceID(context.Background())
 
 	for _, callback := range m.traceCallbacks {
-		callback(ctx, "close", nil)
+		done := callback(ctx, "close", nil)
+
+		defer done(ctx, err)
 	}
 
 	begin := time.Now()
 
-	err := m.inner.Close()
+	err = m.inner.Close()
 
 	duration := time.Since(begin)
 
@@ -170,10 +206,10 @@ func (m *middleware) Close() error {
 // Option type.
 type Option func(*middleware)
 
-// WithRandReader functional option to substitute the random io.Reader.
-func WithRandReader(reader io.Reader) Option {
+// WithRandomSource64 functional option to substitute the random io.Reader.
+func WithRandomSource64(source rand.Source64) Option {
 	return func(m *middleware) {
-		m.randReader = reader
+		m.randomSource64 = source
 	}
 }
 
@@ -209,12 +245,16 @@ func WithCloseCallback(callback CloseCallback) Option {
 }
 
 func Wrap(inner gokv.Store, opts ...Option) gokv.Store {
+	if len(opts) == 0 {
+		return inner
+	}
+
 	var rngSeed int64
 	_ = binary.Read(crand.Reader, binary.LittleEndian, &rngSeed)
 
 	m := &middleware{
-		inner:      inner,
-		randReader: rand.New(rand.NewSource(rngSeed)),
+		inner:          inner,
+		randomSource64: rand.New(rand.NewSource(rngSeed)),
 	}
 
 	for _, opt := range opts {

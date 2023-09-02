@@ -12,17 +12,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/philippgille/gokv"
+	"github.com/philippgille/gokv/gomap"
 	"github.com/philippgille/gokv/middleware"
 	middleware_logrus "github.com/philippgille/gokv/middleware/logrus"
+	gokv_test "github.com/philippgille/gokv/test"
 )
 
 func TestMiddlewareLogger(t *testing.T) {
 	t.Parallel()
 
 	var rngSeed int64 = 1
-	var nopTraceID middleware.TraceID
-
-	_, _ = rand.New(rand.NewSource(rngSeed)).Read(nopTraceID[:])
+	nopTraceID := middleware.TraceID(rand.New(rand.NewSource(rngSeed)).Uint64())
 
 	testcases := []struct {
 		label   string
@@ -48,7 +48,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				assert.True(t, found)
 				assert.Equal(t, v, 1)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.DebugLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -74,7 +74,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				assert.False(t, found)
 				assert.Equal(t, v, 0)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.DebugLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -100,7 +100,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				assert.False(t, found)
 				assert.Equal(t, v, 0)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.WarnLevel,
 				"gokv.Store return error",
 				logrus.Fields{
@@ -129,7 +129,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				assert.True(t, found)
 				assert.Equal(t, v, 1)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.DebugLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -152,7 +152,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				err := s.Set("foo", 1)
 				assert.NoError(t, err)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.DebugLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -174,7 +174,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				err := s.Set("foo", 1)
 				assert.EqualError(t, err, "ops")
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.WarnLevel,
 				"gokv.Store return error",
 				logrus.Fields{
@@ -196,7 +196,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				err := s.Delete("foo")
 				assert.NoError(t, err)
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.DebugLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -218,7 +218,7 @@ func TestMiddlewareLogger(t *testing.T) {
 				err := s.Delete("foo")
 				assert.EqualError(t, err, "ops")
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.WarnLevel,
 				"gokv.Store return error",
 				logrus.Fields{
@@ -240,7 +240,7 @@ func TestMiddlewareLogger(t *testing.T) {
 
 				assert.NoError(t, s.Close())
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.InfoLevel,
 				"gokv.Store return success",
 				logrus.Fields{
@@ -261,7 +261,7 @@ func TestMiddlewareLogger(t *testing.T) {
 
 				assert.EqualError(t, s.Close(), "ops")
 			},
-			verify: Verify(1,
+			verify: verify(1,
 				logrus.ErrorLevel,
 				"gokv.Store return error",
 				logrus.Fields{
@@ -286,12 +286,13 @@ func TestMiddlewareLogger(t *testing.T) {
 
 			randReader := rand.New(rand.NewSource(rngSeed))
 			opts := []middleware_logrus.Option{
-				middleware_logrus.WithBaseMiddlewareOption(middleware.WithRandReader(randReader)),
+				middleware_logrus.WithLogger(logger),
+				middleware_logrus.WithBaseMiddlewareOption(middleware.WithRandomSource64(randReader)),
 			}
 
 			opts = append(opts, tc.opts...)
 
-			storeLogger := middleware_logrus.WithLogrus(store, logger, opts...)
+			storeLogger := middleware_logrus.WithLogrus(store, opts...)
 
 			tc.test(t, storeLogger)
 
@@ -300,7 +301,86 @@ func TestMiddlewareLogger(t *testing.T) {
 	}
 }
 
-func Verify(n int,
+func TestTrace(t *testing.T) {
+	t.Parallel()
+
+	var rngSeed int64 = 1
+
+	nopTraceID := middleware.TraceID(rand.New(rand.NewSource(rngSeed)).Uint64())
+
+	store := newStoreMock(t)
+	store.On("Set", "foo", 1).Return(nil)
+
+	logger, hook := test.NewNullLogger()
+	logger.SetLevel(logrus.TraceLevel)
+
+	randReader := rand.New(rand.NewSource(rngSeed))
+	opts := []middleware_logrus.Option{
+		middleware_logrus.WithLogger(logger),
+		middleware_logrus.WithBaseMiddlewareOption(middleware.WithRandomSource64(randReader)),
+	}
+
+	storeLogger := middleware_logrus.WithLogrus(store, opts...)
+
+	err := storeLogger.Set("foo", 1)
+	assert.NoError(t, err)
+
+	require.Len(t, hook.Entries, 2)
+
+	firstLine := hook.Entries[0]
+
+	assert.Equal(t, logrus.TraceLevel, firstLine.Level)
+	assert.Equal(t, "trace call to gokv.Store", firstLine.Message)
+	assert.Equal(t, logrus.Fields{
+		"key":       "foo",
+		"operation": "set",
+		"value":     1,
+		"trace-id":  nopTraceID,
+	}, firstLine.Data)
+}
+
+func TestStore(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := test.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	store := gomap.NewStore(gomap.DefaultOptions)
+
+	storeLogger := middleware_logrus.WithLogrus(store, middleware_logrus.WithLogger(logger))
+
+	gokv_test.TestStore(storeLogger, t)
+}
+
+func TestTypes(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := test.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	store := gomap.NewStore(gomap.DefaultOptions)
+
+	storeLogger := middleware_logrus.WithLogrus(store, middleware_logrus.WithLogger(logger))
+
+	gokv_test.TestTypes(storeLogger, t)
+}
+
+func TestStoreConcurrent(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := test.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	store := gomap.NewStore(gomap.DefaultOptions)
+
+	storeLogger := middleware_logrus.WithLogrus(store, middleware_logrus.WithLogger(logger))
+
+	goroutineCount := 1000
+
+	gokv_test.TestConcurrentInteractions(t, goroutineCount, storeLogger)
+}
+
+func verify(n int,
 	level logrus.Level,
 	logMsg string,
 	fields logrus.Fields,
@@ -334,7 +414,6 @@ func Verify(n int,
 			_, ok := entry.Data[logrus.ErrorKey]
 			require.False(t, ok)
 		}
-
 	}
 }
 
@@ -369,7 +448,8 @@ func (m *storeMock) Close() error {
 func newStoreMock(t interface {
 	mock.TestingT
 	Cleanup(func())
-}) *storeMock {
+},
+) *storeMock {
 	mock := &storeMock{}
 	mock.Mock.Test(t)
 

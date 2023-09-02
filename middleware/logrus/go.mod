@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/philippgille/gokv v0.6.0
+	github.com/philippgille/gokv/gomap v0.6.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.8.4
 )

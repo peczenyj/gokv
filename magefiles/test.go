@@ -23,7 +23,7 @@ func testImpl(impl string) (err error) {
 		if err = os.Chdir("./" + impl); err != nil {
 			return err
 		}
-		defer os.Chdir("..") // This swallows the error in case there is one, but that's okay as the mage process is exited anyway
+		defer func() { _ = os.Chdir("..") }() // This swallows the error in case there is one, but that's okay as the mage process is exited anyway
 
 		var out string
 		out, err = script.Exec("go test -v -race -coverprofile=coverage.txt -covermode=atomic").String()
@@ -73,7 +73,7 @@ func testImpl(impl string) (err error) {
 		dockerCmd += `hazelcast -p 5701:5701 --health-cmd='curl -f http://localhost:5701/hazelcast/health/node-state' --health-interval 1s ` + dockerImage
 	case "ignite":
 		dockerImage = "apacheignite/ignite"
-		dockerCmd += `ignite -p 10800:10800 --health-cmd='${IGNITE_HOME}/bin/control.sh --baseline | grep "Cluster state: active"' --health-interval 1s ` + dockerImage
+		dockerCmd += `ignite -p 10800:10800 --health-cmd='${IGNITE_HOME}/bin/control.sh --baseline | grep "Cluster state: ACTIVE"' --health-interval 1s ` + dockerImage
 	case "memcached":
 		dockerImage = "memcached"
 		dockerCmd += `memcached -p 11211:11211 --health-cmd='echo stats | nc -w 1 localhost 11211' --health-interval 1s ` + dockerImage
@@ -84,6 +84,14 @@ func testImpl(impl string) (err error) {
 	case "mysql":
 		dockerImage = "mysql"
 		dockerCmd += `mysql -e MYSQL_ALLOW_EMPTY_PASSWORD=true -p 3306:3306 --health-cmd='mysqladmin ping -h localhost' --health-interval 1s ` + dockerImage
+		// MySQL requires some extra time after the container is healthy
+		setup = func() error {
+			time.Sleep(5 * time.Second)
+			return nil
+		}
+	case "pgx":
+		dockerImage = "postgres:alpine"
+		dockerCmd += `postgres -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=pgx -p 5433:5432 --health-cmd='pg_isready -U postgres' --health-interval 1s ` + dockerImage
 	case "postgresql":
 		dockerImage = "postgres:alpine"
 		dockerCmd += `postgres -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=gokv -p 5432:5432 --health-cmd='pg_isready -U postgres' --health-interval 1s ` + dockerImage
@@ -217,7 +225,7 @@ func testImpl(impl string) (err error) {
 	if err != nil {
 		return err
 	}
-	defer os.Chdir("..") // This swallows the error in case there is one, but that's okay as the mage process is exited anyway
+	defer func() { _ = os.Chdir("..") }() // This swallows the error in case there is one, but that's okay as the mage process is exited anyway
 
 	var out string
 	out, err = script.Exec("go test -v -race -coverprofile=coverage.txt -covermode=atomic").String()

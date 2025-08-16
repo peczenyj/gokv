@@ -1,0 +1,103 @@
+name: ci
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+jobs:
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ '1.23', '1.24' ]
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: 'false'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: "**/go.sum"
+      - uses: magefile/mage-action@v3
+        with:
+          version: v1.15.0
+          install-only: true
+
+      - run: |
+          go version
+          go env
+          mage -version
+          docker version
+
+      - run: mage build
+
+  lint:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: 'false'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.24
+          cache-dependency-path: "**/go.sum"
+      - uses: magefile/mage-action@v3
+        with:
+          version: v1.15.0
+          install-only: true
+
+      - run: |
+          go version
+          go env
+          mage -version
+          docker version
+
+      # We use the golangci-lint GitHub Action only for installing the tool.
+      # It doesn't automatically lint in submodules, and instead of writing a Bash
+      # script here in our workflow that we can't run locally, we use Mage instead.
+      - uses: golangci/golangci-lint-action@v8
+      - run: mage lint all
+
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ '1.23', '1.24' ]
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: 'false'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: "**/go.sum"
+      - uses: magefile/mage-action@v3
+        with:
+          version: v1.15.0
+          install-only: true
+
+      - run: |
+          go version
+          go env
+          mage -version
+          docker version
+
+      # Test all modules
+      # This starts and stops Docker containers for services like PostgreSQL, Redis etc.
+      # Takes up to 10m on GitHub Actions
+      # TODO: Change workflow so that when only one module is changed, only that module's tests are run
+      - run: mage test all
+
+      # Combining of coverage reports not required with the action, which detects all reports in subdirectories and uploads all of them
+      #- run: build/combine-coverage.sh
+      # Upload coverage data to codecov.io
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
